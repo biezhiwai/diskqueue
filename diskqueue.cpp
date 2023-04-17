@@ -12,6 +12,7 @@
 #include <functional>
 #include <boost/filesystem.hpp>
 #include <boost/format.hpp>
+#include <sw/redis++/redis++.h>
 
 void Log(const std::string &str) {
     std::cout << str << std::endl;
@@ -23,7 +24,7 @@ private:
     int64_t writePos = 0;
     int64_t readFileNum = 0;
     int64_t writeFileNum = 0;
-    int64_t depth = 0;
+    std::atomic<int64_t> depth{0};
 
     std::string name;
     boost::filesystem::path dataPath;
@@ -68,10 +69,12 @@ public:
             Log("open file error");
             return false;
         }
-        if (5 > fscanf(fp, "%ld\n%ld,%ld\n%ld,%ld\n", &depth, &readFileNum, &readPos, &writeFileNum, &writePos)) {
+        int64_t depthTmp;
+        if (5 > fscanf(fp, "%ld\n%ld,%ld\n%ld,%ld\n", &depthTmp, &readFileNum, &readPos, &writeFileNum, &writePos)) {
             Log("fscanf error");
             return false;
         }
+        depth.store(depthTmp);
         nextReadFileNum = readFileNum;
         nextReadPos = readPos;
 
@@ -95,7 +98,7 @@ public:
 
     // 返回队列元素个数
     int64_t Depth() {
-        return depth;
+        return depth.load();
     }
 
     // 持久化元数据
@@ -109,7 +112,7 @@ public:
             return false;
         }
 
-        if (5 > fprintf(fp, "%ld\n%ld,%ld\n%ld,%ld\n", depth, readFileNum, readPos, writeFileNum, writePos)) {
+        if (5 > fprintf(fp, "%ld\n%ld,%ld\n%ld,%ld\n", depth.load(), readFileNum, readPos, writeFileNum, writePos)) {
             Log("fprintf error");
             fclose(fp);
             return false;
@@ -188,7 +191,7 @@ public:
         }
 
         writePos += totalBytes;
-        depth += 1;
+        depth++;
         return true;
     }
 
@@ -202,13 +205,7 @@ public:
                 return nullptr;
             }
 
-            if (readPos > 0) {
-                if (-1 == ::lseek(readFile, readPos, SEEK_SET)) {
-                    ::close(readFile);
-                    readFile = -1;
-                    return nullptr;
-                }
-            }
+
 
             maxBytesPerFileRead = maxBytesPerFile;
             if (readFileNum < writeFileNum) {
@@ -216,6 +213,13 @@ public:
                 if (-1 != fstat(readFile, &fileStat)) {
                     maxBytesPerFileRead = fileStat.st_size;
                 }
+            }
+        }
+        if (readPos >= 0) {
+            if (-1 == ::lseek(readFile, readPos, SEEK_SET)) {
+                ::close(readFile);
+                readFile = -1;
+                return nullptr;
             }
         }
 
@@ -260,7 +264,7 @@ public:
         auto oldReadFileNum = readFileNum;
         readFileNum = nextReadFileNum;
         readPos = nextReadPos;
-        depth -= 1;
+        depth--;
 
         if (oldReadFileNum != nextReadFileNum) {
             needSync = true;
@@ -369,40 +373,100 @@ public:
     }
 };
 
-typedef std::function<bool(uint64_t seq, std::string message)> MessageHandler;
-
 class DiskMQ {
 private:
-    diskQueue *key_dq;
-    diskQueue *seq_dq;
-    diskQueue *data_dq;
+    diskQueue *q;
 
     std::string name;
     boost::filesystem::path dataPath;
+
     std::mutex qmt;                  // 队列锁
-    std::condition_variable qcv;     // 队列条件变量
-    MessageHandler handler;          // 消费的数据处理句柄
     std::thread consumer_thread;     // 消费者线程
     std::atomic<bool> stop{false}; // 线程终止标志位
-public:
 
+    //    std::condition_variable qcv;
+public:
+    sw::redis::RedisCluster* redis = nullptr;
+    DiskMQ(const std::string &name,const std::string &dataPath):name(name),dataPath(dataPath){
+        q = new diskQueue(name, dataPath, 300, 0, 100);
+        redis = new sw::redis::RedisCluster(
+                "tcp://123@127.0.0.1:6381?keep_alive=true&connect_timeout=2000ms&socket_timeout=2000ms");
+        consumer_thread=std::thread([this]{
+            while(!stop){
+                try{
+                    sleep(1);
+                    q->sync();
+                    redis->set("test","ok");
+                    while(q->Depth()){
+                        void* readBuf;
+                        {
+                            std::unique_lock<std::mutex>lock(qmt);
+                            int32_t len;
+                            readBuf = q->readOne(len);
+                            if(!readBuf){
+                                q->handleReadError();
+                                break;
+                            }
+                        }
+                        // 反序列化
+                        auto keyLen = (int32_t *)readBuf;
+                        std::string key((char*)readBuf+4,*keyLen);
+                        auto dataLen = (int32_t *)((char*)readBuf+4+*keyLen);
+                        std::string data((char*)readBuf+4+*keyLen+4,*dataLen);
+                        auto seq = (uint64_t*)((char*)readBuf+4+*keyLen+4+*dataLen);
+                        redis->zadd(key,data,*seq);
+                        {
+                            std::unique_lock<std::mutex>lock(qmt);
+                            q->moveForward();
+                        }
+                    }
+                }catch(const sw::redis::Error &e){
+                    printf("[Error] %s\n",e.what());
+                }
+            }
+        });
+    }
+
+    ~DiskMQ(){
+        while(q->Depth()) usleep(10000);
+        stop.store(true);
+        consumer_thread.join();
+    }
+    // 序列化
+    void* serialize(const std::string &key,const void* data,int32_t dataLen,uint64_t seq,int32_t &len){
+        int32_t keyLen = key.size();
+        len = 4+keyLen+4+dataLen+8;
+        auto serializeBuf = new char[len];
+        if(nullptr==::memcpy(serializeBuf,&keyLen,4)) return nullptr;
+        if(nullptr==::memcpy(serializeBuf + 4,key.c_str(),keyLen)) return nullptr;
+        if(nullptr==::memcpy(serializeBuf + 4 + keyLen,&dataLen,4)) return nullptr;
+        if(nullptr==::memcpy(serializeBuf + 4 + keyLen + 4,data,dataLen)) return nullptr;
+        if(nullptr==::memcpy(serializeBuf + 4 + keyLen + 4 + dataLen,&seq,8)) return nullptr;
+        return serializeBuf;
+    }
+    // 生产者，用于将存储失败的数据（由key，data，seq组成）存入文件队列
+    void Produce(const std::string &key,const std::string &data,uint64_t seq){
+        int32_t len;
+        auto serializeBuf= serialize(key,data.c_str(),data.size(),seq,len);
+        std::unique_lock<std::mutex>lock(qmt);
+        q->writeOne(serializeBuf,len);
+    }
 };
 
 
 int main() {
-    char strs[10][20] = {"1234567", "asdfghjf", "omkmmkomm"};
-    diskQueue d("Order", "/home/cxk/CLionProjects/test/Order/", 50, 0, 16);
-//    for (int i = 0; i < 20; i++) {
-//        d.writeOne(strs[i%3], strlen(strs[i%3]) + 1);
-//        d.sync();
-//    }
-
-    for (int i = 0; i < 20; i++) {
-        int32_t len;
-        auto str = (char *) d.readOne(len);
-        std::cout << str << std::endl;
-        d.moveForward();
-        d.sync();
-        if(d.Depth()==0) break;
+    DiskMQ dq("Order","/home/cxk/CLionProjects/diskqueue/Order/");
+    int n=dq.redis->zcard("aaa");
+    for (int i = n; i < n+100000; i++) {
+        dq.Produce("aaa",std::to_string(i),i);
     }
+
+//    for (int i = 0; i < 1; i++) {
+//        int32_t len;
+//        auto str = (char *) d.readOne(len);
+//        std::cout << str << std::endl;
+//        d.moveForward();
+//        d.sync();
+//        if(d.Depth()==0) break;
+//    }
 }
